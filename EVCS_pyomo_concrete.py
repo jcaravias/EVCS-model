@@ -5,56 +5,47 @@
 """ NOTES 
 - need to change this such that the speed changes depending on the rate of the charger 
 - implement correct charge/dischage rates, correct infrastructure prices 
-- create Networkx figure?!
+- account for if number of chargers is greater than number of nodes --> need to add capacity greater than 1  **
 """ 
 ##########################################################################
 
 import pyomo.environ as pyo
 from pyomo.opt import SolverFactory
+from pyomo.util.infeasible import log_infeasible_constraints
+import logging
+
 import random
 import pandas as pd
 
 from call_EVCS import *
 
-model = pyo.ConcreteModel()
-
+#initalize model inputs
 no_chargers = 10
-no_agents = 5
-no_nodes = 3
-no_ticks = 10
-    
-df, travel_list, move_indicator, edge_weight_list = call_model(no_chargers, no_agents, no_ticks)
 
-def format_data1(data, no_ticks, no_agents): 
-    #use only for edge weight dict
+no_work = 30
+no_stores = 20
+no_homes = 40
+
+no_nodes = no_work + no_stores + no_homes
+no_agents = no_homes
+
+no_ticks = 30
+    
+#get EV agent travel data from EVCS model world
+def format_edge_weights(data, no_ticks, no_agents): 
+    #returns dictionary with key (agent j, tick k) and value is edge weight of completed trip for agent j at tick k
     result = {}
-    for i in range(no_agents):#i = number agents
-        
-        for j in range(len(data[i])): #j = number ticks
-            if (i + 1, j + 1) not in result.keys():
-                result[(i + 1 , j + 1)] = data[i][j]
+    for j in range(no_agents):#j = agents
+        for k in range(len(data[j])): #k = ticks
+            if (j + 1, k + 1) not in result.keys():
+                result[(j + 1 , k + 1)] = data[j][k]
             else:
-                result[(i + 1, j + 1)].append(data[i][j])
+                result[(j + 1, k + 1)].append(data[j][k])
     return result
 
-# def format_data2(data, no_ticks, no_agents, no_nodes): 
-#     #NEED TO CHANGE THIS SO THAT LOC IS IJK
-#     #use only for location dict
-#     result = {}
-#     # result (agent, tick):
-#     for i in no_nodes: # iterate over all nodes
-#         for k in data.keys(): #keys are ticks, 
-#             for j in range(no_agents): #j is agent 
-#                 if (i, j + 1, k + 1) not in result.keys():
-#                     result[(i, j + 1 , k + 1)] = data[k][j]
-#                 else: 
-#                     result[(j + 1, k + 1)].append(data[k][j])
-#     return result
-
-def format_data2(data, no_nodes, no_ticks, no_agents):
-    #CHECK INDEXING!
+def format_locations(data, no_nodes, no_ticks, no_agents):
+    #returns dictionary with key (node i, agent j, tick k) and value binary indicator if agent j is at node i on time step k
     result = {} 
-    #i = node, j = agent, k = tick
     for i in range(no_nodes): 
         for j in range(no_agents): 
             for k in range(no_ticks):  
@@ -64,45 +55,50 @@ def format_data2(data, no_nodes, no_ticks, no_agents):
                     result[(i + 1, j + 1, k + 1)] = 0
     return result
 
+#get data and format
+MW, df, travel_list, move_indicator, edge_weight_list = call_model(no_nodes, no_work, no_stores, no_homes,no_chargers, no_agents, no_ticks)
 
-#Define parameters
+
+location_dict = df.to_dict()['Agent location'] 
+
+#location_dict = {0: [0, 1, 2, 3, 4], 1: [0, 1, 7, 6, 4], 2: [6, 5, 7, 6, 6], 3: [6, 5, 7, 6, 6], 4: [6, 5, 7, 6, 6]}
+#edge_weight_list = {0: [0, 0, 0, 0, 0], 1: [0, 0, 5, 5, 0], 2: [5, 5, 0, 0, 5], 3: [0, 0, 0, 0, 0], 4: [0, 0, 0, 0, 0]}
+
+
+edge_weight_data = format_edge_weights(edge_weight_list, no_ticks, no_agents)
+loc_data = format_locations(location_dict, no_nodes, no_ticks, no_agents)
+
+##########################################################################
+#OPTIMIZATION FRAMEWORK 
+##########################################################################
+
+model = pyo.ConcreteModel() #define pyomo concrete model
+
+#PARAMETERS
 model.no_chargers = pyo.Param(initialize = no_chargers)#number charging stations
 model.no_agents = pyo.Param(initialize = no_agents)#number EV agents 
 model.no_ticks = pyo.Param(initialize = no_ticks) #number of timesteps (1 tick = 30 minutes)
 model.no_nodes = pyo.Param(initialize = no_nodes)#number of nodes
 
 
-#define index sets 
+#INDEX SETS
 model.I = pyo.RangeSet(model.no_nodes) #iterate over all nodes 
 model.J = pyo.RangeSet(model.no_agents) #iterate over all EV agents 
 model.K = pyo.RangeSet(model.no_ticks) #iteration over all time steps
 
-
-#PARAMETERS
-#define coefficients
+#COEFFICIENTS
 model.charge_factor_fast = pyo.Param(initialize = 5) #increase in charge per tick for fast charger 
 model.charge_factor_slow = pyo.Param(initialize = 2) #increase in charge per tick for slow charger
+model.charge_factor = pyo.Param(initialize = 2) #increase in charge per tick 
 
-model.charge_factor = pyo.Param(initialize = 5) #increase in charge per tick 
-
+model.discharge_factor = pyo.Param(initialize = 30)
 
 model.lambda_s = pyo.Param(initialize = 5) #cost per slow charger
 model.lambda_f = pyo.Param(initialize = 3) #cost per fast charger
 model.alpha = pyo.Param(initialize = 0.4) #multi-objective cost weighting parameter
 
-#get data
-location_dict = df.to_dict()['Agent location'] 
-# print("HEREE LOCATION DICT") #dict that maps ticks to list of agent locations 
-# print(location_dict)
-
-edge_weight_data = format_data1(edge_weight_list, no_ticks, no_agents)
-loc_data = format_data2(location_dict, no_nodes, no_ticks, no_agents)
-
-# print("****************************************************************************") 
-# print(loc_data)
-
+#Define EV agent travel and location values 
 #model.w = pyo.Param(model.J, initialize = wait_times) #average wait time for EV agent j
-model.soc = pyo.Param(model.J, model.K,initialize = 100, mutable = True) #charge level of ev agent j at time step k, itialized to 100%
 model.loc = pyo.Param(model.I, model.J, model.K, initialize = loc_data) #indicator that agent j is located at node i at time step k
 model.weight = pyo.Param(model.J, model.K, initialize = edge_weight_data) #edge weight if the agent completes a trip
 
@@ -115,71 +111,74 @@ model.weight = pyo.Param(model.J, model.K, initialize = edge_weight_data) #edge 
 # print("***********************")
 # model.weight.display()
 
+def soc_bounds(m, j, k): 
+    return (20, 100)
+
 #DECISION VARIABLES
-#***** EV agent decisions to charge variables ****** 
-model.c = pyo.Var(model.I, model.J, model.K, within = pyo.Binary) #decision to charge for agent j at location i at time step k
+model.soc = pyo.Var(model.J, model.K,initialize = 100, bounds = soc_bounds) #charge level of ev agent j at time step k, itialized to 100%
+model.c = pyo.Var(model.I, model.J, model.K, within = pyo.Binary) #binary decision to charge for agent j at location i at time step k
+model.d = pyo.Var(model.I,within=pyo.Binary) #binary decision for placement of charging station at each node i
 
-#*****Charging station decision variables ****** 
-#binary decision for placement of charging station at each node 
-model.d = pyo.Var(model.I,within=pyo.Binary)
+model.charge = pyo.Var(model.J, model.K, within= pyo.Binary) #indicator variable that agent j charged at step k
 
-#binary decision for FAST charger at node i 
-model.f = pyo.Var(model.I,within=pyo.Binary)
 
-#binary decision for SLOW charger at node i 
-model.s = pyo.Var(model.I,within=pyo.Binary)
-
-#indicator variable that agent j charged at step k
-model.charge = pyo.Var(model.J, model.K, within= pyo.Binary) 
+model.f = pyo.Var(model.I,within=pyo.Binary) #binary decision for FAST charger at node i 
+model.s = pyo.Var(model.I,within=pyo.Binary) #binary decision for SLOW charger at node i 
 
 
 #OBJECTIVE FUNCTION
 def obj_expression(m):
+    #minimize the infrastcture cost of each placed charging station
     infra_cost = sum([m.d[i] * (m.lambda_s*m.s[i] + m.lambda_f*m.f[i]) for i in model.I]) 
     return infra_cost 
 
-#assign objective function to model
-model.OBJ = pyo.Objective(expr=obj_expression)
+model.OBJ = pyo.Objective(expr=obj_expression) #assign objective function to model
 
 # print("OBJECTIVE FUNCTION")
 # model.OBJ.display()
 
-def charge_indicator(m, j, k):
-    return m.charge[j, k] == sum(m.c[i, j, k] for i in m.I)
-
-model.charge_indicator = pyo.Constraint(model.J, model.K, rule=charge_indicator)
-# model.charge_indicator.pprint()
 
 
-# #CONSTRAINTS 
+#CONSTRAINTS 
 def soc_constraint(m, j, k):
-    #soc_it = soc_i(t-1) + (c_itn * charge_factor)  + (move_indicator * edge weight) 
+    #SOC is initalied to 100 at first time step. 
+    #Then SOC for time step k is equal to SOC at step k - 1 plus additional charge from charging minus charge from completing a trip
     if k == 1: 
-        return model.soc[j, k] == 100
+        return m.soc[j, k] == 100
         #return pyo.Constraint.Skip
     else: 
-        charge_increase = (m.charge_factor * m.charge[j, k]) 
-        drive_decrease = (m.weight[j,k] * 200) / 420 * 100
-        previous_soc = m.soc[j, k - 1]
-        current_soc = previous_soc + charge_increase - drive_decrease
-        
-        # print("decrease", "j",j, "k", k,(pyo.value(m.weight[j,k]) * 200) / 420 * 100)
-        
-#         increase = pyo.value(m.charge_factor) * pyo.value(m.charge[j, k])
-#         decrease = pyo.value(m.weight[j,k]* 200) / 420 * 100
-#         prev = pyo.value(m.soc[j, k - 1])
-#         current = prev + increase - decrease 
-        
-#         print("HELLO WORLD", current)
-        # print("here")
-        return model.soc[j, k] == model.soc[j, k-1] + (model.charge_factor * model.charge[j,k]) - (model.weight[j, k])# * 200 / 420 * 100)
-        # return model.soc[j, k] == current_soc
+        return  m.soc[j, k] == m.soc[j, k-1] + (m.charge_factor * m.charge[j,k]) - (pyo.value(m.weight[j,k]) *m.discharge_factor)
+    
+print("WEIGHT")
+model.weight.display()
     
 model.soc_constraint = pyo.Constraint(model.J, model.K, rule=soc_constraint)
 print("DISPLAY SOC CONSTRAINT")
 model.soc_constraint.pprint()
 
-#charger assignment logical constriants
+# def sufficient_charge(m, j, k): 
+#     #SOC for each EV agent must remain above 20%
+#     return m.soc[j,k] >= 20 
+
+# model.sufficient_charge = pyo.Constraint(model.J, model.K, rule=sufficient_charge)
+# print("DISPLAY SUFFICIENT CHARGE")
+# model.sufficient_charge.pprint()
+
+
+def charge_indicator(m, j, k):
+    #Defines the charge indicator
+    return m.charge[j, k] == sum(m.c[i, j, k] for i in m.I)
+
+model.charge_indicator = pyo.Constraint(model.J, model.K, rule=charge_indicator)
+# model.charge_indicator.pprint()
+
+def no_charger_constraint(m): 
+    #the sum of assigned chargers for each node must equal the stated number of chargers 
+    return sum(m.d[i] for i in m.I) == m.no_chargers
+
+model.no_charger_constraint = pyo.Constraint(rule=no_charger_constraint)
+# model.no_charger_constraint.pprint()
+
 def single_agent_use(m, i, k): 
     #for each time step, only one agent can be plugged into a given charger
     return sum(m.c[i,j,k] for j in m.J) <= 1 
@@ -192,10 +191,16 @@ def charger_agent_loc(m, i, j, k):
 
 model.charger_agent_loc = pyo.Constraint(model.I, model.J, model.K, rule=charger_agent_loc)
 
+def existing_charger_constraint(m, i, j, k): 
+    #there must be a charger placed at node i in order for an agent to charge here
+    return m.d[i] >= m.c[i,j,k] 
+
+model.existing_charger_constraint = pyo.Constraint(model.I, model.J, model.K, rule=existing_charger_constraint)
+
 def fast_slow_constraint(m, i):
     #charger can only be assigned as fast OR slow
     #if fast then not slow, if slow then not fast
-    return m.f[i] + m.s[i] == 1
+    return m.f[i] + m.s[i] == m.d[i]
 
 model.fast_slow_constraint = pyo.Constraint(model.I, rule=fast_slow_constraint)
 
@@ -213,29 +218,55 @@ def slow_charger_constraint(m, i):
 
 model.slow_charger_constraint = pyo.Constraint(model.I, rule=slow_charger_constraint)
 
-
 #set optimizer as Gurobi and solve
 opt = SolverFactory('gurobi')
 results = opt.solve(model,tee=True) 
+
+log_infeasible_constraints(model, log_expression=True, log_variables=True)
+logging.basicConfig(filename='example.log', encoding='utf-8', level=logging.INFO)
+
+# model.computeIIS()
+# model.write("model.ilp")
+
+
+
 
 #display optimization results 
 results.write()
 # model.pprint()
 
-# print("PLACEMENT") 
-# print(model.d.display()) 
+print("PLACEMENT") 
+print(model.d.display()) 
 
-# print("FAST")
-# print(model.f.display())
+print("FAST")
+print(model.f.display())
 
-# print("SLOW")
-# print(model.s.display())
+print("SLOW")
+print(model.s.display())
 
 # print("LOCATION")
 # model.loc.display() 
 
-# print("SOC") 
-# model.soc.display() 
+print("SOC") 
+model.soc.display() 
+
+print("CHARGE") 
+print(model.charge.display())
+
+print("CHARGE LOC C") 
+
+for i in range(1, no_nodes): 
+    for j in range(1, no_agents): 
+        for k in range(1, no_ticks): 
+            if int(pyo.value(model.c[i, j,k])) == 1: 
+                print(i,j,k) 
+           
+                
+
+# print(test)
+# print("HEREERE")
+# for i in 
+# print(model.c.display())
 
 # print("EDGE WEIGHTS") 
 # model.weight.display() 
@@ -243,45 +274,48 @@ results.write()
 
 
 
+
 #EXPORT DATA FROM OPTIMIZATION
-#charger placement data frame
-df = pd.DataFrame()
-charger_placement = [pyo.value(model.d[i]) for i in model.I]
-fast_chargers = [pyo.value(model.f[i]) for i in model.I]
-slow_chargers = [pyo.value(model.s[i]) for i in model.I]
+# charger_df = pd.DataFrame()
+# charger_placement = [pyo.value(model.d[i]) for i in model.I]
+# fast_chargers = [pyo.value(model.f[i]) for i in model.I]
+# slow_chargers = [pyo.value(model.s[i]) for i in model.I]
 
-df["charger placement"] = charger_placement
-df["fast chargers"] = fast_chargers
-df["slow chargers"] = slow_chargers
+# charger_df["charger placement"] = charger_placement
+# charger_df["fast chargers"] = fast_chargers
+# charger_df["slow chargers"] = slow_chargers
 
-print(df)
+# def get_data(): 
+#     return MW, charger_df
 
-df.to_csv("charger_placement.csv")
+# print(df)
 
-#agent charging decision data frame, index is the tick value is a list where each entry is binary indiactor for if the agent is charging
-df2 = pd.DataFrame()
-charge_indicator = []
-# location_indicator = []
+# df.to_csv("charger_placement.csv")
 
-for k in model.K:
-    agent_charging = [pyo.value(model.charge[j, k]) for j in model.J]
-    charge_indicator.append(agent_charging)
+# #agent charging decision data frame, index is the tick value is a list where each entry is binary indiactor for if the agent is charging
+# df2 = pd.DataFrame()
+# charge_indicator = []
+# # location_indicator = []
+
+# for k in model.K:
+#     agent_charging = [pyo.value(model.charge[j, k]) for j in model.J]
+#     charge_indicator.append(agent_charging)
     
-#     for i in model.I: 
-#         location = [pyo.value(model.loc[i, j, k]) for j in model.J]
-#         location_indicator += location
-                      
-                      
-# df2["agent charging"] = charge_indicator
-# df2["agent location"] = location_indicator
+# #     for i in model.I: 
+# #         location = [pyo.value(model.loc[i, j, k]) for j in model.J]
+# #         location_indicator += location
+                                        
+# # df2["agent charging"] = charge_indicator
+# # df2["agent location"] = location_indicator
 
                     
                   
 
-# print(df2)
+# # print(df2)
 
-df2.to_csv("chage_indicator.csv")
+# df2.to_csv("chage_indicator.csv")
 
 
 
+############################################################################################
 
