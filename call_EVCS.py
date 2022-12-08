@@ -5,6 +5,7 @@ from EVCS_agent_model2 import *
 import pandas as pd 
 import numpy as np
 import math
+import networkx as nx
 
 def get_move_edge_weight(G, move_indicator,travel_list): 
     result = {}
@@ -21,7 +22,21 @@ def get_move_edge_weight(G, move_indicator,travel_list):
         result[agent] = result_list 
     return result
 
-def call_model(no_chargers, no_agents, no_ticks):
+
+def get_subgraph(G, trip_lists): 
+    """Returns a subgraph of G that only incldues edges traversed by the agents""" 
+    SG = nx.Graph()
+    #copy edges from original model world graph
+    SG.add_nodes_from(G)
+    for agent in trip_lists.keys(): 
+        nodes_visited = trip_lists[agent][0]
+        
+        for i in range(len(nodes_visited) -1):
+            SG.add_edge(nodes_visited[i], nodes_visited[i+1])
+            
+    return SG
+
+def call_model(no_nodes, no_work, no_stores, no_homes,no_chargers, no_agents, no_ticks):
     """
     Inputs: pyomo params: #EVs, #charging stations, #nodes
     Output (as single pandas df): 
@@ -30,9 +45,9 @@ def call_model(no_chargers, no_agents, no_ticks):
     Output to be read in as data for concrete pyomo model
      """ 
     flag = False
-    no_homes = no_agents
-    no_work = math.floor(no_chargers / 2)
-    no_stores = math.floor(no_chargers / 2)
+    no_homes = no_homes
+    no_work = no_work
+    no_stores = no_stores
     no_fast = math.floor(no_chargers /2)
     scenario = 2
     charge_rates = (26.3, 3.47, 0.7) #(fast charger rate, slow charger rate, home charger rate) 
@@ -51,6 +66,8 @@ def call_model(no_chargers, no_agents, no_ticks):
     travel_list = MW.get_travel(trip_lists)
     move_indicator = MW.get_move_indicator(travel_list) 
     edge_weight_list = get_move_edge_weight(Model_Graph, move_indicator,travel_list)
+    
+    SG = get_subgraph(MW.G, trip_lists)
 
     charger_placement = MW.get_charger_placement(scenario, int(n))
         
@@ -67,7 +84,7 @@ def call_model(no_chargers, no_agents, no_ticks):
     df["Agent location"] = data_collection["Agent location"]
     df["Length of Queue"] = data_collection['Length of Queue']
 
-    return df, travel_list, move_indicator, edge_weight_list
+    return MW, SG, df, travel_list, move_indicator, edge_weight_list
     
 
 no_chargers = 5 
@@ -76,4 +93,3 @@ no_ticks = 30
 
 
     
-data, travel_list, move_list, edge_weight_list = call_model(no_chargers, no_agents, no_ticks)

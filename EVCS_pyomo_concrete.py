@@ -3,8 +3,6 @@
 
 ##########################################################################
 """ NOTES 
-- need to change this such that the speed changes depending on the rate of the charger 
-- implement correct charge/dischage rates, correct infrastructure prices 
 - account for if number of chargers is greater than number of nodes --> need to add capacity greater than 1  **
 """ 
 ##########################################################################
@@ -12,24 +10,28 @@
 import pyomo.environ as pyo
 from pyomo.opt import SolverFactory
 from pyomo.util.infeasible import log_infeasible_constraints
-import logging
 
 import random
 import pandas as pd
+import numpy as np
+
+from sklearn import preprocessing
 
 from call_EVCS import *
 
 #initalize model inputs
-no_chargers = 10
+no_chargers = 10 #no_charges <= no_nodes, cannot have multiple chargers at single node 
 
-no_work = 30
-no_stores = 20
-no_homes = 40
+
+
+no_work = 5
+no_stores = 10
+no_homes = 30
 
 no_nodes = no_work + no_stores + no_homes
 no_agents = no_homes
 
-no_ticks = 30
+no_ticks = 144 #3 days
     
 #get EV agent travel data from EVCS model world
 def format_edge_weights(data, no_ticks, no_agents): 
@@ -56,17 +58,13 @@ def format_locations(data, no_nodes, no_ticks, no_agents):
     return result
 
 #get data and format
-MW, df, travel_list, move_indicator, edge_weight_list = call_model(no_nodes, no_work, no_stores, no_homes,no_chargers, no_agents, no_ticks)
+MW, SG, df, travel_list, move_indicator, edge_weight_list = call_model(no_nodes, no_work, no_stores, no_homes,no_chargers, no_agents, no_ticks)
 
-
-location_dict = df.to_dict()['Agent location'] 
-
-#location_dict = {0: [0, 1, 2, 3, 4], 1: [0, 1, 7, 6, 4], 2: [6, 5, 7, 6, 6], 3: [6, 5, 7, 6, 6], 4: [6, 5, 7, 6, 6]}
-#edge_weight_list = {0: [0, 0, 0, 0, 0], 1: [0, 0, 5, 5, 0], 2: [5, 5, 0, 0, 5], 3: [0, 0, 0, 0, 0], 4: [0, 0, 0, 0, 0]}
-
-
+location_dict = df.to_dict()['Agent location'] #dictionary that maps tick to list of agent locations
 edge_weight_data = format_edge_weights(edge_weight_list, no_ticks, no_agents)
 loc_data = format_locations(location_dict, no_nodes, no_ticks, no_agents)
+
+
 
 ##########################################################################
 #OPTIMIZATION FRAMEWORK 
@@ -87,20 +85,20 @@ model.J = pyo.RangeSet(model.no_agents) #iterate over all EV agents
 model.K = pyo.RangeSet(model.no_ticks) #iteration over all time steps
 
 #COEFFICIENTS
-model.charge_factor_fast = pyo.Param(initialize = 5) #increase in charge per tick for fast charger 
-model.charge_factor_slow = pyo.Param(initialize = 2) #increase in charge per tick for slow charger
-model.charge_factor = pyo.Param(initialize = 2) #increase in charge per tick 
+model.charge_factor_f = pyo.Param(initialize = 26.3) #increase in charge per tick for fast charger 
+model.charge_factor_s = pyo.Param(initialize = 3.47) #increase in charge per tick for slow charger
 
-model.discharge_factor = pyo.Param(initialize = 30)
+model.discharge_factor = pyo.Param(initialize = 4.7) #decrease in soc per unit edge weight = (20 / 420) * 100 = 4.7
 
-model.lambda_s = pyo.Param(initialize = 5) #cost per slow charger
-model.lambda_f = pyo.Param(initialize = 3) #cost per fast charger
-model.alpha = pyo.Param(initialize = 0.4) #multi-objective cost weighting parameter
+
+model.lambda_s = pyo.Param(initialize = 1182) #cost per slow charger 
+model.lambda_f = pyo.Param(initialize = 28401) #cost per fast charger
+model.alpha = pyo.Param(initialize = 0.5) #multi-objective cost weighting parameter
 
 #Define EV agent travel and location values 
 #model.w = pyo.Param(model.J, initialize = wait_times) #average wait time for EV agent j
 model.loc = pyo.Param(model.I, model.J, model.K, initialize = loc_data) #indicator that agent j is located at node i at time step k
-model.weight = pyo.Param(model.J, model.K, initialize = edge_weight_data) #edge weight if the agent completes a trip
+model.weight = pyo.Param(model.J, model.K, initialize = edge_weight_data) #edge weight if the agent completes a trip, edge weight is given in tick to complete trip
 
 # print("***********************")
 # model.soc.display()
@@ -115,28 +113,44 @@ def soc_bounds(m, j, k):
     return (20, 100)
 
 #DECISION VARIABLES
-model.soc = pyo.Var(model.J, model.K,initialize = 100, bounds = soc_bounds) #charge level of ev agent j at time step k, itialized to 100%
+model.soc = pyo.Var(model.J, model.K,initialize = 100, bounds = (20,100)) #charge level of ev agent j at time step k, itialized to 100%
 model.c = pyo.Var(model.I, model.J, model.K, within = pyo.Binary) #binary decision to charge for agent j at location i at time step k
 model.d = pyo.Var(model.I,within=pyo.Binary) #binary decision for placement of charging station at each node i
 
-model.charge = pyo.Var(model.J, model.K, within= pyo.Binary) #indicator variable that agent j charged at step k
+# model.charge = pyo.Var(model.J, model.K, within= pyo.Binary) #indicator variable that agent j charged at step k
 
+model.charge_f = pyo.Var(model.J, model.K, within= pyo.Binary) #indicator variable that agent j charged at step k at a FAST charger
+model.charge_s = pyo.Var(model.J, model.K, within= pyo.Binary) #indicator variable that agent j charged at step k at a SLOW charger
 
 model.f = pyo.Var(model.I,within=pyo.Binary) #binary decision for FAST charger at node i 
 model.s = pyo.Var(model.I,within=pyo.Binary) #binary decision for SLOW charger at node i 
+
+max_infra_cost = pyo.value(model.lambda_f) * no_nodes #if only built fast chargers at every node
+print(max_infra_cost)
 
 
 #OBJECTIVE FUNCTION
 def obj_expression(m):
     #minimize the infrastcture cost of each placed charging station
-    infra_cost = sum([m.d[i] * (m.lambda_s*m.s[i] + m.lambda_f*m.f[i]) for i in model.I]) 
-    return infra_cost 
+    infra_cost = sum([m.d[i] * (m.lambda_s*m.s[i] + m.lambda_f*m.f[i]) for i in m.I]) 
+   
+    
+    infra_cost_normalized = infra_cost / max_infra_cost
+    
+    #maximize the sum of soc 
+    soc_average_agent = 0
+    for k in range(1,no_ticks): 
+        soc_average_agent += np.mean([m.soc[j,k] for j in range(1,no_agents)]) # average soc for all agents per time step 
+        
+    soc_overall_average = soc_average_agent / no_ticks / 100
+    # soc_total_normalized = preprocessing.normalize(no_agents)
+    # print(soc_total_normalized)
+    return (m.alpha * infra_cost_normalized) - (1 - m.alpha) * soc_overall_average
 
 model.OBJ = pyo.Objective(expr=obj_expression) #assign objective function to model
 
 # print("OBJECTIVE FUNCTION")
 # model.OBJ.display()
-
 
 
 #CONSTRAINTS 
@@ -147,37 +161,28 @@ def soc_constraint(m, j, k):
         return m.soc[j, k] == 100
         #return pyo.Constraint.Skip
     else: 
-        return  m.soc[j, k] == m.soc[j, k-1] + (m.charge_factor * m.charge[j,k]) - (pyo.value(m.weight[j,k]) *m.discharge_factor)
-    
-print("WEIGHT")
-model.weight.display()
+        # return  m.soc[j, k] == m.soc[j, k-1] + (m.charge_factor * m.charge[j,k]) - (pyo.value(m.weight[j,k]) *m.discharge_factor)
+        return  m.soc[j, k] == m.soc[j, k-1] + (m.charge_factor_f * m.charge_f[j,k]) + (m.charge_factor_s * m.charge_s[j,k]) - (pyo.value(m.weight[j,k]) *m.discharge_factor)
+
+# print("WEIGHT")
+# model.weight.display()
     
 model.soc_constraint = pyo.Constraint(model.J, model.K, rule=soc_constraint)
-print("DISPLAY SOC CONSTRAINT")
-model.soc_constraint.pprint()
-
-# def sufficient_charge(m, j, k): 
-#     #SOC for each EV agent must remain above 20%
-#     return m.soc[j,k] >= 20 
-
-# model.sufficient_charge = pyo.Constraint(model.J, model.K, rule=sufficient_charge)
-# print("DISPLAY SUFFICIENT CHARGE")
-# model.sufficient_charge.pprint()
+# print("DISPLAY SOC CONSTRAINT")
+# model.soc_constraint.pprint()
 
 
-def charge_indicator(m, j, k):
-    #Defines the charge indicator
-    return m.charge[j, k] == sum(m.c[i, j, k] for i in m.I)
+def charge_indicator_f(m, j, k):
+    #Defines the fast charge indicator
+    return m.charge_f[j, k] == sum(m.c[i, j, k] * m.f[i] for i in m.I)
 
-model.charge_indicator = pyo.Constraint(model.J, model.K, rule=charge_indicator)
-# model.charge_indicator.pprint()
+model.charge_indicator_f = pyo.Constraint(model.J, model.K, rule=charge_indicator_f)
 
-def no_charger_constraint(m): 
-    #the sum of assigned chargers for each node must equal the stated number of chargers 
-    return sum(m.d[i] for i in m.I) == m.no_chargers
+def charge_indicator_s(m, j, k):
+    #Defines the slow charge indicator
+    return m.charge_s[j, k] == sum(m.c[i, j, k] * m.s[i] for i in m.I)
 
-model.no_charger_constraint = pyo.Constraint(rule=no_charger_constraint)
-# model.no_charger_constraint.pprint()
+model.charge_indicator_s = pyo.Constraint(model.J, model.K, rule=charge_indicator_s)
 
 def single_agent_use(m, i, k): 
     #for each time step, only one agent can be plugged into a given charger
@@ -222,18 +227,13 @@ model.slow_charger_constraint = pyo.Constraint(model.I, rule=slow_charger_constr
 opt = SolverFactory('gurobi')
 results = opt.solve(model,tee=True) 
 
-log_infeasible_constraints(model, log_expression=True, log_variables=True)
-logging.basicConfig(filename='example.log', encoding='utf-8', level=logging.INFO)
-
-# model.computeIIS()
-# model.write("model.ilp")
-
-
 
 
 #display optimization results 
 results.write()
 # model.pprint()
+print("OBJECTIVE")
+print(pyo.value(model.OBJ))
 
 print("PLACEMENT") 
 print(model.d.display()) 
@@ -244,22 +244,28 @@ print(model.f.display())
 print("SLOW")
 print(model.s.display())
 
-# print("LOCATION")
-# model.loc.display() 
+# # # print("LOCATION")
+# # # model.loc.display() 
 
-print("SOC") 
-model.soc.display() 
+# print("CHARGE FAST") 
+# model.charge_f.display()
 
-print("CHARGE") 
-print(model.charge.display())
+print("CHARGE SLOW") 
+model.charge_s.display()
 
-print("CHARGE LOC C") 
+# print("SOC") 
+# model.soc.display() 
 
-for i in range(1, no_nodes): 
-    for j in range(1, no_agents): 
-        for k in range(1, no_ticks): 
-            if int(pyo.value(model.c[i, j,k])) == 1: 
-                print(i,j,k) 
+# print("CHARGE") 
+# print(model.charge.display())
+
+# print("CHARGE LOC C") 
+
+# for i in range(1, no_nodes): 
+#     for j in range(1, no_agents): 
+#         for k in range(1, no_ticks): 
+#             if int(pyo.value(model.c[i, j,k])) == 1: 
+#                 print(i,j,k) 
            
                 
 
@@ -275,18 +281,53 @@ for i in range(1, no_nodes):
 
 
 
-#EXPORT DATA FROM OPTIMIZATION
-# charger_df = pd.DataFrame()
-# charger_placement = [pyo.value(model.d[i]) for i in model.I]
-# fast_chargers = [pyo.value(model.f[i]) for i in model.I]
-# slow_chargers = [pyo.value(model.s[i]) for i in model.I]
+# EXPORT DATA FROM OPTIMIZATION
+#charger data
+charger_df = pd.DataFrame()
+charger_placement = [pyo.value(model.d[i]) for i in model.I]
+fast_chargers = [pyo.value(model.f[i]) for i in model.I]
+slow_chargers = [pyo.value(model.s[i]) for i in model.I]
 
-# charger_df["charger placement"] = charger_placement
-# charger_df["fast chargers"] = fast_chargers
-# charger_df["slow chargers"] = slow_chargers
+charger_df["charger placement"] = charger_placement
+charger_df["fast chargers"] = fast_chargers
+charger_df["slow chargers"] = slow_chargers
 
-# def get_data(): 
-#     return MW, charger_df
+#agent data
+soc_df = pd.DataFrame()
+average_soc = [] #average soc over all agents at time step k
+for k in model.K:
+    average_soc.append(np.mean([pyo.value(model.soc[j,k]) for j in model.J]))
+soc_df["average soc"] = average_soc
+
+
+
+charging_list = []
+for k in model.K: 
+    agent_charging = []
+    for j in model.J: 
+        agent_charging.append(pyo.value(model.charge_f[j,k]) + pyo.value(model.charge_s[j,k]))
+    charging_list.append(agent_charging)
+
+agent_charge_df = pd.DataFrame(charging_list)
+ 
+
+                               
+def get_data():
+    infra_cost = sum([pyo.value(model.d[i]) * (pyo.value(model.lambda_s)*pyo.value(model.s[i]) + pyo.value(model.lambda_f)*pyo.value(model.f[i])) for i in model.I]) 
+    infra_cost_normalized = infra_cost / max_infra_cost
+    soc_average_agent = 0
+    for k in range(1,no_ticks): 
+        soc_average_agent += np.mean([pyo.value(model.soc[j,k]) for j in range(1,no_agents)])
+    print("infra_cost", infra_cost) 
+    print("infra_cost_normalized", infra_cost_normalized)
+    
+    print("soc_total", soc_average_agent /no_ticks/100) 
+    print("objective funtion", pyo.value(model.OBJ))
+    
+    return MW, SG, charger_df, soc_df, agent_charge_df, location_dict
+
+
+get_data()
 
 # print(df)
 
